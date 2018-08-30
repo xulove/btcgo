@@ -4,7 +4,7 @@ import (
 	"net"
 	"sync"
 	"time"
-	"log"
+	"github.com/btcsuite/btcgo/logo"
 	"github.com/btcsuite/btcd/wire"
 	"fmt"
 	"errors"
@@ -209,7 +209,34 @@ func NewPeerBase(origCfg *Config,inbound bool)*Peer{
 	    return &p
 
 }
-
+func (p *Peer)negotiateInboundProtocol() error{
+	return nil
+}
+func (p *Peer)negotiateOutboundProtocol() error{
+	if err := p.writeLocalVersion();err != nil{
+		return err
+	}
+	return p.readRemoteVersionMsg()
+}
+func (p *Peer)writeLocalVersion() error{
+	localVerMsg,err := p.localVersionMsg()
+	if err != nil{
+		return err
+	}
+	return p.writeMessage(localVerMsg,wire.LatestEncoding)
+}
+func (p *Peer)localVersionMsg()(*wire.MsgVersion,error){
+	var blockNum int32
+	if p.cfg.NewestBlock != nil{
+		var err error
+		_,blockNum,err := p.cfg.NewestBlock()
+		if err!= nil{
+			return nil,err
+		}
+	}
+	theirNA := p.na
+	if
+}
 func (p *Peer)start() error {
 	fmt.Printf("starting peer %s",p)
 	negotiateErr := make (chan error)
@@ -228,7 +255,7 @@ func (p *Peer)start() error {
 	case <-time.After(negotiateTimeout):
 		return errors.New("protocol negotiation timeout")
 	}
-	log.Debugf()
+
 }
 
 

@@ -7,8 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ivpusic/grpool"
-	lumberjack "gopkg.in/natefinch/lumberjack.v2"
+	lumberjack "github.com/btcsuite/btcgo/logo/lumberjack"
 )
 
 // LevelError ...
@@ -26,7 +25,7 @@ type Logger struct {
 	warn  *log.Logger
 	info  *log.Logger
 	debug *log.Logger
-	p     *grpool.Pool
+	p     *Pool
 	depth int
 }
 
@@ -37,14 +36,13 @@ func NewLogger(flag int, numWorkers int, jobQueueLen int, depth int) *Logger {
 }
 
 // NewLogger2 ...
-func NewLogger2(lfn string, maxsize int, flag int, numWorkers int, jobQueueLen int, depth int) *Logger {
+func NewLogger2(filename string, maxsize int, flag int, numWorkers int, jobQueueLen int, depth int) *Logger {
 	jack := &lumberjack.Logger{
-		Filename: lfn,
+		Filename: filename,
 		MaxSize:  maxsize, // megabytes
 	}
 
 	logger := NewLogger3(jack, flag, numWorkers, jobQueueLen, depth)
-
 	return logger
 }
 
@@ -63,7 +61,7 @@ func NewLogger3(w io.Writer, flag int, numWorkers int, jobQueueLen int, depth in
 
 	logger.SetLevel(LevelInformational)
 
-	logger.p = grpool.NewPool(numWorkers, jobQueueLen)
+	logger.p = NewPool(numWorkers, jobQueueLen)
 
 	return logger
 }
