@@ -3,6 +3,7 @@ import (
 	"io"
 	"encoding/binary"
 	"time"
+	"math"
 )
 const (
 	// MaxVarIntPayload is the maximum payload size for a variable length integer.
@@ -16,6 +17,8 @@ var (
 	littleEndian = binary.LittleEndian
 	bigEndian = binary.BigEndian
 )
+var errNonCanonicalVarInt = "non-canonical varint %x - discriminant %x must " +
+	"encode a value greater than %x"
 // binaryFreeList :是用作一个缓冲队列
 type binaryFreeList chan []byte
 // 从缓冲队列binaryFreeList中借8个字节
@@ -54,7 +57,7 @@ func (l binaryFreeList) Uint8(r io.Reader)(uint8,error){
 
 func(l binaryFreeList) Uint16(r io.Reader,byteOrder binary.ByteOrder)(uint16,error){
 	buf := l.Borrow()[:2]
-	if _,err := io.ReaderFull(r,buf);err != nil{
+	if _,err := io.ReadFull(r,buf);err != nil{
 		l.Return(buf)
 		return 0,nil
 	}
@@ -64,7 +67,7 @@ func(l binaryFreeList) Uint16(r io.Reader,byteOrder binary.ByteOrder)(uint16,err
 }
 func(l binaryFreeList) Uint32(r io.Reader,byteOrder binary.ByteOrder)(uint32,error){
 	buf := l.Borrow()[:4]
-	if _,err := io.ReaderFull(r,buf);err != nil{
+	if _,err := io.ReadFull(r,buf);err != nil{
 		l.Return(buf)
 		return 0,nil
 	}
@@ -74,7 +77,7 @@ func(l binaryFreeList) Uint32(r io.Reader,byteOrder binary.ByteOrder)(uint32,err
 }
 func(l binaryFreeList) Uint64(r io.Reader,byteOrder binary.ByteOrder)(uint64,error){
 	buf := l.Borrow()[:8]
-	if _,err := io.ReaderFull(r,buf);err != nil{
+	if _,err := io.ReadFull(r,buf);err != nil{
 		l.Return(buf)
 		return 0,nil
 	}
@@ -90,7 +93,7 @@ func (l binaryFreeList) PutUint8(w io.Writer,val uint8) error{
 	buf[0] = val
 	_,err := w.Write(buf)
 	l.Return(buf)
-	return error
+	return err
 }
 
 func (l binaryFreeList) PutUint16(w io.Writer,byteOrder binary.ByteOrder,val uint16) error{
@@ -98,21 +101,21 @@ func (l binaryFreeList) PutUint16(w io.Writer,byteOrder binary.ByteOrder,val uin
 	byteOrder.PutUint16(buf,val)
 	_,err := w.Write(buf)
 	l.Return(buf)
-	return error
+	return err
 }
 func (l binaryFreeList) PutUint32(w io.Writer,byteOrder binary.ByteOrder,val uint32) error{
 	buf := l.Borrow()[:4]
 	byteOrder.PutUint32(buf,val)
 	_,err := w.Write(buf)
 	l.Return(buf)
-	return error
+	return err
 }
 func (l binaryFreeList) PutUint64(w io.Writer,byteOrder binary.ByteOrder,val uint64) error{
 	buf := l.Borrow()[:8]
 	byteOrder.PutUint64(buf,val)
 	_,err := w.Write(buf)
 	l.Return(buf)
-	return error
+	return err
 }
 
 var binarySerializer binaryFreeList = make(chan []byte,binaryFreeListMaxItems)
@@ -172,7 +175,7 @@ func readElement(r io.Reader,element interface{}) error{
 		if err != nil{
 			return nil
 		}
-		*e = uint32Time(time.Uinx64(int64(rv),0))
+		*e = uint32Time(time.Unix(int64(rv),0))
 		return nil
 	case *int64Time:
 		rv, err := binarySerializer.Uint64(r, binary.LittleEndian)
@@ -218,6 +221,7 @@ func readElements(r io.Reader,elements ...interface{}) error{
 // 就是把element编码成字节然后写入到w中
 func writeElement(w io.Writer, element interface{}) error {
 	//需要补充
+	
 }
 func writeElements(w io.Writer, elements ...interface{}) error {
 	for _, element := range elements {
@@ -239,12 +243,79 @@ func WriteVarInt(w io.Writer,pver uint32,val uint64)error{
 		return binarySerializer.PutUint8(w,uint8(val))
 	}
 	if val <= math.MaxUint16{
-		
+		err := binarySerializer.PutUint8(w,0xfd)
+		if err != nil{
+			return err
+		}
+		return binarySerializer.PutUint16(w,littleEndian,uint16(val))
 	}
+	if val <= math.MaxUint32{
+		err := binarySerializer.PutUint8(w,0xfe)
+		if err != nil{
+			return err
+		}
+		return binarySerializer.PutUint32(w.littleEndian,uint32(val))
+	}
+	err := binarySerializer.PutUint8(w,0xff)
+	if err != nil{
+		return err
+	}
+	return binarySerializer.PutUint64(w,littleEndian,val)
 }
 // writeVarInt的逆过程
 func ReadVarInt(r io.Reader, pver uint32) (uint64, error){
-	//待补充
+	// 从Reader中读取一个字节
+	discriminant,err := binarySerializer.Uint8(r)
+	if err != nil{
+		return 0,err
+	}
+	var rv uint64
+	switch discriminant{
+	case 0xff:
+		sv,err := binarySerializer.Uint64(r,littleEndian)
+		if err != nil{
+			return 0,err
+		}
+		rv = sv
+		min := uint64(0x100000000)
+		// 相当于一个二次判断。看他这个值到底值不值得uint64编码
+		if rv < min {
+			return 0, messageError("ReadVarInt", fmt.Sprintf(
+				errNonCanonicalVarInt, rv, discriminant, min))
+		}
+	case 0xfe:
+		sv, err := binarySerializer.Uint32(r, littleEndian)
+		if err != nil {
+			return 0, err
+		}
+		rv = uint64(sv)
+
+		// The encoding is not canonical if the value could have been
+		// encoded using fewer bytes.
+		min := uint64(0x10000)
+		if rv < min {
+			return 0, messageError("ReadVarInt", fmt.Sprintf(
+				errNonCanonicalVarInt, rv, discriminant, min))
+		}
+
+	case 0xfd:
+		sv, err := binarySerializer.Uint16(r, littleEndian)
+		if err != nil {
+			return 0, err
+		}
+		rv = uint64(sv)
+
+		// The encoding is not canonical if the value could have been
+		// encoded using fewer bytes.
+		min := uint64(0xfd)
+		if rv < min {
+			return 0, messageError("ReadVarInt", fmt.Sprintf(
+				errNonCanonicalVarInt, rv, discriminant, min))
+		}
+	default:
+		rv := uint64(discriminant)
+	}
+	return rv,nil  //最后的返会值，还是uint64的
 }
 
 

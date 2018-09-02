@@ -2,6 +2,9 @@ package wire
 
 import (
 	"io"
+	"fmt"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"bytes"
 )
 // 消息头的字节长度
 const MessageHeaderSize = 24
@@ -18,7 +21,7 @@ const (
 	// messages, the new encoding format detailed in BIP0144 will be used.
 	WitnessEncoding
 )
-type message interface {
+type Message interface {
 	BtcDecode(io.Reader,uint32,MessageEncoding)error
 	BtcEncode(io.Writer,uint32,MessageEncoding)error
 	Command() string
@@ -43,6 +46,8 @@ func ReadMessageN(r io.Reader,pver uint32,btcnet BitcoinNet)(int,Message,[]byte,
 }
 func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,enc MessageEncoding) (int, Message, []byte, error){
 	totalBytes := 0
+	// 读取并解析消息头用我们已经封装好的方法。
+	// io.Reader实际上是net.Conn对象，也就是TCP socket
 	n,hdr,err := readMessageHeader(r)
 	totalBytes += n
 	if err != nil{
@@ -94,7 +99,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,enc Me
 	if err != nil {
 		return totalBytes,nil,nil,err
 	}
-	//检查checksum
+	//检查checksum.对payload进行hash校验，看payload是否被修改过
 	checksum := chainhash.DoubleHashB(payload)[0:4]
 	if !bytes.Equal(checksum[:], hdr.checksum[:]) {
 		str := fmt.Sprintf("payload checksum failed - header "+
@@ -103,13 +108,14 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,enc Me
 		return totalBytes, nil, nil, messageError("ReadMessage", str)
 	}
 	pr := bytes.NewBuffer(payload)
-	err = mag.BtcDecode(pr,pver,enc)
+	// 用Message的抽象方法BtcDecode()对消息体进行解析
+	err = msg.BtcDecode(pr,pver)
 	if err != nil {
 		return totalBytes, nil, nil, err
 	}
-	
+	// msg中已经包含了messageHeader，payload是有效载荷，messageHeader辅助读取，验证等
 	return totalBytes, msg, payload, nil  
-	// 为什么这里只返会了msg，msg才是有效载荷，messageHeader辅助读取，验证等
+	
 } 
 func readMessageHeader(r io.Reader)(int,*messageHeader,error){
 	var headerBytes [MessageHeaderSize]byte
@@ -126,7 +132,72 @@ func readMessageHeader(r io.Reader)(int,*messageHeader,error){
 	return n,&hdr,nil
 }
 
+func WriteMessageWithEncodingN(w io.Writer, msg Message, pver uint32,
+	btcnet BitcoinNet, encoding MessageEncoding) (int, error) {
 
+	totalBytes := 0
+
+	// Enforce max command size.
+	var command [CommandSize]byte
+	cmd := msg.Command()
+	if len(cmd) > CommandSize {
+		str := fmt.Sprintf("command [%s] is too long [max %v]",
+			cmd, CommandSize)
+		return totalBytes, messageError("WriteMessage", str)
+	}
+	copy(command[:], []byte(cmd))
+
+	// Encode the message payload.
+	var bw bytes.Buffer
+	err := msg.BtcEncode(&bw, pver, encoding)
+	if err != nil {
+		return totalBytes, err
+	}
+	payload := bw.Bytes()
+	lenp := len(payload)
+
+	// Enforce maximum overall message payload.
+	if lenp > MaxMessagePayload {
+		str := fmt.Sprintf("message payload is too large - encoded "+
+			"%d bytes, but maximum message payload is %d bytes",
+			lenp, MaxMessagePayload)
+		return totalBytes, messageError("WriteMessage", str)
+	}
+
+	// Enforce maximum message payload based on the message type.
+	mpl := msg.MaxPayloadLength(pver)
+	if uint32(lenp) > mpl {
+		str := fmt.Sprintf("message payload is too large - encoded "+
+			"%d bytes, but maximum message payload size for "+
+			"messages of type [%s] is %d.", lenp, cmd, mpl)
+		return totalBytes, messageError("WriteMessage", str)
+	}
+
+	// Create header for the message.
+	hdr := messageHeader{}
+	hdr.magic = btcnet
+	hdr.command = cmd
+	hdr.length = uint32(lenp)
+	copy(hdr.checksum[:], chainhash.DoubleHashB(payload)[0:4])
+
+	// Encode the header for the message.  This is done to a buffer
+	// rather than directly to the writer since writeElements doesn't
+	// return the number of bytes written.
+	hw := bytes.NewBuffer(make([]byte, 0, MessageHeaderSize))
+	writeElements(hw, hdr.magic, command, hdr.length, hdr.checksum)
+
+	// Write header.
+	n, err := w.Write(hw.Bytes())
+	totalBytes += n
+	if err != nil {
+		return totalBytes, err
+	}
+
+	// Write payload.
+	n, err = w.Write(payload)
+	totalBytes += n
+	return totalBytes, err
+}
 
 
 

@@ -210,21 +210,55 @@ func NewPeerBase(origCfg *Config,inbound bool)*Peer{
 
 }
 func (p *Peer)negotiateInboundProtocol() error{
+	
 	return nil
 }
 func (p *Peer)negotiateOutboundProtocol() error{
-	if err := p.writeLocalVersion();err != nil{
+	if err := p.writeLocalVersionMsg();err != nil{
 		return err
 	}
 	return p.readRemoteVersionMsg()
 }
-func (p *Peer)writeLocalVersion() error{
+func (p *Peer)writeLocalVersionMsg() error{
 	localVerMsg,err := p.localVersionMsg()
 	if err != nil{
 		return err
 	}
 	return p.writeMessage(localVerMsg,wire.LatestEncoding)
 }
+func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
+	if atomic.LoadInt32(&p.disconnect) != 0{
+		return nil
+	}
+	log.Debugf("%v", newLogClosure(func() string {
+		// Debug summary of message.
+		summary := messageSummary(msg)
+		if len(summary) > 0 {
+			summary = " (" + summary + ")"
+		}
+		return fmt.Sprintf("Sending %v%s to %s", msg.Command(),
+			summary, p)
+	}))
+	log.Tracef("%v", newLogClosure(func() string {
+		return spew.Sdump(msg)
+	}))
+	log.Tracef("%v", newLogClosure(func() string {
+		var buf bytes.Buffer
+		_, err := wire.WriteMessageWithEncodingN(&buf, msg, p.ProtocolVersion(),
+			p.cfg.ChainParams.Net, enc)
+		if err != nil {
+			return err.Error()
+		}
+		return spew.Sdump(buf.Bytes())
+	}))
+	n,err := wire.WriteMessageWithEncodingN(p.conn,msg,p.ProtocolVersion(), p.cfg.ChainParams.Net, enc)
+	atomic.AddUint64(&p.bytesSent, uint64(n))
+	if p.cfg.Listeners.OnWrite != nil {
+		p.cfg.Listeners.OnWrite(p, n, msg, err)
+	}
+	return err
+}
+
 func (p *Peer)localVersionMsg()(*wire.MsgVersion,error){
 	var blockNum int32
 	if p.cfg.NewestBlock != nil{
@@ -235,7 +269,27 @@ func (p *Peer)localVersionMsg()(*wire.MsgVersion,error){
 		}
 	}
 	theirNA := p.na
-	if
+	if p.cfg.Proxy != "" {
+		proxyaddress, _, err := net.SplitHostPort(p.cfg.Proxy)
+		// invalid proxy means poorly configured, be on the safe side.
+		if err != nil || p.na.IP.String() == proxyaddress {
+			theirNA = wire.NewNetAddressIPPort(net.IP([]byte{0, 0, 0, 0}), 0, 0)
+		}
+	}
+	
+	ourNa := &wire.NetAddress{
+		Services:p.cfg.Services,
+	}
+	nonce := uint64(rand.Int63())
+	sentNonces.Add(nonce)
+	msg := wire.NewMsgVersion(ourNa,theirNa,nonce,blockNum)
+	msg.AddUserAgent(p.cfg.UserAgentName,p.cfg.UserAgentVersion,p.cfg.UserAgentComments...)
+	
+	msg.AddrYou.Services = wire.SFNodeNetwork
+	msg.Services = p.cfg.Services
+	msg.ProtocolVersion = int32(p.cfg.ProtocolVersion)
+	msg.DisableRelayTx = p.cfg.DisableRelayTx
+	return msg, nil
 }
 func (p *Peer)start() error {
 	fmt.Printf("starting peer %s",p)
