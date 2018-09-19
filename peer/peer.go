@@ -1,14 +1,19 @@
 package peer
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcgo/logo"
+	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
-	"github.com/btcsuite/btcgo/logo"
-	"github.com/btcsuite/btcd/wire"
-	"fmt"
-	"errors"
 )
+
 type Peer struct {
 	// The following variables must only be used atomically.
 	bytesReceived uint64
@@ -165,69 +170,75 @@ type MessageListeners struct {
 	OnWrite func(p *Peer, bytesWritten int, msg wire.Message, err error)
 }
 
-func NewPeerBase(origCfg *Config,inbound bool)*Peer{
-	// 如若不是由调用者制定，则默认为最大的支持协议版本	
+func NewPeerBase(origCfg *Config, inbound bool) *Peer {
+	// 如若不是由调用者制定，则默认为最大的支持协议版本
 	cfg := *origCfg
 	if cfg.ProtocolVersion == 0 {
 		cfg.ProtocolVersion = MaxProtocolVersion
 	}
-	if cfg.ChainParams == nil{
+	if cfg.ChainParams == nil {
 		cfg.ChainParams = &chaincfg.TestNet3Params
 	}
 
 	p := Peer{
-		inbound:         inbound,
-		wireEncoding:    wire.BaseEncoding,
+		inbound:      inbound,
+		wireEncoding: wire.BaseEncoding,
 		//已经发送给Peer的Inventory的缓存。
-		knownInventory:  newMruInventoryMap(maxKnownInventory),
+		knownInventory: newMruInventoryMap(maxKnownInventory),
 		//带缓冲的stallControlMsg chan，在收，发消息的goroutine和超时控制goroutine之间通信
-		stallControl:    make(chan stallControlMsg, 1), // nonblocking sync
-		//带缓冲的outMsg chan，实现了一个发送队列		
-		outputQueue:     make(chan outMsg, outputBufferSize),
+		stallControl: make(chan stallControlMsg, 1), // nonblocking sync
+		//带缓冲的outMsg chan，实现了一个发送队列
+		outputQueue: make(chan outMsg, outputBufferSize),
 		//缓冲大小为1的outMsg chan，用于将outputQueue中的outMsg按加入发送队列的顺序发送给Peer。
-		sendQueue:       make(chan outMsg, 1),   // nonblocking sync
+		sendQueue: make(chan outMsg, 1), // nonblocking sync
 		//带缓冲的channel，用于通知维护发送队列的goroutine上一个消息已经发送完成，应该取下一条消息发送。
-		sendDoneQueue:   make(chan struct{}, 1), // nonblocking sync
+		sendDoneQueue: make(chan struct{}, 1), // nonblocking sync
 		//实现发送inv消息的发送队列，该队列以10s为周期向Peer发送inv消息。
-		outputInvChan:   make(chan *wire.InvVect, outputBufferSize),
+		outputInvChan: make(chan *wire.InvVect, outputBufferSize),
 		//用于通知收消息的goroutine已经退出
-		inQuit:          make(chan struct{}),
-		queueQuit:       make(chan struct{}),
+		inQuit:    make(chan struct{}),
+		queueQuit: make(chan struct{}),
 		//用于通知发消息的goroutine已经退出，当收、发消息的goroutine均退出时，超时控制goroutine也将退出。
-		outQuit:         make(chan struct{}),
+		outQuit: make(chan struct{}),
 		//用于通知所有处理事务的goroutine退出。
-		quit:            make(chan struct{}),
+		quit: make(chan struct{}),
 		//与Peer相关的Config，其中比较重要是Config中的MessageListeners，
 		// 指明了处理与Peer收到的消息的响应函数
-		cfg:             cfg, // Copy so caller can't mutate.
+		cfg: cfg, // Copy so caller can't mutate.
 		//于记录Peer支持的服务，如SFNodeNetwork表明Peer是一个全节点
 		//SFNodeGetUTXO表明Peer支持getutxos和utxos命令，
 		// SFNodeBloom表明Peer支持Bloom过滤
 		services:        cfg.Services,
 		protocolVersion: cfg.ProtocolVersion,
-	    }
-	    return &p
+	}
+	return &p
 
 }
-func (p *Peer)negotiateInboundProtocol() error{
-	
-	return nil
+
+//等待并读取、处理Peer发过来的Version消息;
+// 向Peer发送自己的Version消息;
+func (p *Peer) negotiateInboundProtocol() error {
+	if err := p.readRemoteVersionMsg(); err != nil {
+		return err
+	}
+
+	return p.writeLocalVersionMsg()
 }
-func (p *Peer)negotiateOutboundProtocol() error{
-	if err := p.writeLocalVersionMsg();err != nil{
+func (p *Peer) negotiateOutboundProtocol() error {
+	if err := p.writeLocalVersionMsg(); err != nil {
 		return err
 	}
 	return p.readRemoteVersionMsg()
 }
-func (p *Peer)writeLocalVersionMsg() error{
-	localVerMsg,err := p.localVersionMsg()
-	if err != nil{
+func (p *Peer) writeLocalVersionMsg() error {
+	localVerMsg, err := p.localVersionMsg()
+	if err != nil {
 		return err
 	}
-	return p.writeMessage(localVerMsg,wire.LatestEncoding)
+	return p.writeMessage(localVerMsg, wire.LatestEncoding)
 }
 func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
-	if atomic.LoadInt32(&p.disconnect) != 0{
+	if atomic.LoadInt32(&p.disconnect) != 0 {
 		return nil
 	}
 	log.Debugf("%v", newLogClosure(func() string {
@@ -251,7 +262,7 @@ func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
 		}
 		return spew.Sdump(buf.Bytes())
 	}))
-	n,err := wire.WriteMessageWithEncodingN(p.conn,msg,p.ProtocolVersion(), p.cfg.ChainParams.Net, enc)
+	n, err := wire.WriteMessageWithEncodingN(p.conn, msg, p.ProtocolVersion(), p.cfg.ChainParams.Net, enc)
 	atomic.AddUint64(&p.bytesSent, uint64(n))
 	if p.cfg.Listeners.OnWrite != nil {
 		p.cfg.Listeners.OnWrite(p, n, msg, err)
@@ -259,13 +270,13 @@ func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
 	return err
 }
 
-func (p *Peer)localVersionMsg()(*wire.MsgVersion,error){
+func (p *Peer) localVersionMsg() (*wire.MsgVersion, error) {
 	var blockNum int32
-	if p.cfg.NewestBlock != nil{
+	if p.cfg.NewestBlock != nil {
 		var err error
-		_,blockNum,err := p.cfg.NewestBlock()
-		if err!= nil{
-			return nil,err
+		_, blockNum, err := p.cfg.NewestBlock()
+		if err != nil {
+			return nil, err
 		}
 	}
 	theirNA := p.na
@@ -276,24 +287,24 @@ func (p *Peer)localVersionMsg()(*wire.MsgVersion,error){
 			theirNA = wire.NewNetAddressIPPort(net.IP([]byte{0, 0, 0, 0}), 0, 0)
 		}
 	}
-	
+
 	ourNa := &wire.NetAddress{
-		Services:p.cfg.Services,
+		Services: p.cfg.Services,
 	}
 	nonce := uint64(rand.Int63())
 	sentNonces.Add(nonce)
-	msg := wire.NewMsgVersion(ourNa,theirNa,nonce,blockNum)
-	msg.AddUserAgent(p.cfg.UserAgentName,p.cfg.UserAgentVersion,p.cfg.UserAgentComments...)
-	
+	msg := wire.NewMsgVersion(ourNa, theirNa, nonce, blockNum)
+	msg.AddUserAgent(p.cfg.UserAgentName, p.cfg.UserAgentVersion, p.cfg.UserAgentComments...)
+
 	msg.AddrYou.Services = wire.SFNodeNetwork
 	msg.Services = p.cfg.Services
 	msg.ProtocolVersion = int32(p.cfg.ProtocolVersion)
 	msg.DisableRelayTx = p.cfg.DisableRelayTx
 	return msg, nil
 }
-func (p *Peer)start() error {
-	fmt.Printf("starting peer %s",p)
-	negotiateErr := make (chan error)
+func (p *Peer) start() error {
+	fmt.Printf("starting peer %s", p)
+	negotiateErr := make(chan error)
 	go func() {
 		if p.inbound {
 			negotiateErr <- p.negotiateInboundProtocol()
@@ -302,49 +313,24 @@ func (p *Peer)start() error {
 		}
 	}()
 	select {
-	case err := <- negotiateErr:
-		if err != nil{
+	case err := <-negotiateErr:
+		if err != nil {
 			return err
 		}
 	case <-time.After(negotiateTimeout):
 		return errors.New("protocol negotiation timeout")
 	}
-
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+func (p *Peer) handleRemoteVersionMsg(msg *wire.MsgVersion) error {
+	if !allowSelfConns && sentNonces.Exists(msg.Nonce) {
+		return errors.New("disconnecting peer connected to self")
+	}
+	if msg.ProtocalVersion < int32(wire.MutipleAddressVersion) {
+		reason := fmt.Sprintf("protocol version must be %d or greater", wire.MutipleAddressVersion)
+		rejectMsg := wire.NewMsgReject(msg.Commad(), wire.RejectObsolete, reason)
+		return p.writeMessage(rejectMsg)
+	}
+	p.statsMtx.Lock()
+	p.lastBlock = msg.LastBlock
+}
