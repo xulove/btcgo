@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"github.com/davecgh/go-spew/spew"
 )
 
 type Peer struct {
@@ -320,17 +321,336 @@ func (p *Peer) start() error {
 	case <-time.After(negotiateTimeout):
 		return errors.New("protocol negotiation timeout")
 	}
+	log.Debugf("Connected to %s", p.Addr())
+	go p.stallHandler()
+	go p.inHandler()
+	go p.queueHandler()
+	go p.outHandler()
+	go p.pingHandler()
+	
+	p.QueueMessage(wire.NewMsgVerAck(),nil)
+	return nil
 }
 
 func (p *Peer) handleRemoteVersionMsg(msg *wire.MsgVersion) error {
+	//检测Version消息里的Nonce是否是自己缓存的nonce值，如果是，则表明该Version消息由自己发送给自己，在实际网络下，不允许节点自己与自己结成Peer，所以这时会返回错误;
 	if !allowSelfConns && sentNonces.Exists(msg.Nonce) {
 		return errors.New("disconnecting peer connected to self")
 	}
+	//检测Version消息里的ProtocolVersion，如果Peer的版本低于209，则拒绝与之相连
 	if msg.ProtocalVersion < int32(wire.MutipleAddressVersion) {
 		reason := fmt.Sprintf("protocol version must be %d or greater", wire.MutipleAddressVersion)
 		rejectMsg := wire.NewMsgReject(msg.Commad(), wire.RejectObsolete, reason)
 		return p.writeMessage(rejectMsg)
 	}
+	//Nonce和ProtocolVersion检查通过后，就开始更新Peer的相关信息，如Peer的最新区块高度、Peer与本地节点的时间偏移等;
 	p.statsMtx.Lock()
 	p.lastBlock = msg.LastBlock
+	p.startingHeight = msg.LastBlcok
+	p.timeOffset = msg.Timestamp.Unix() - time.Now().Unix()
+	p.statsMtx.Unlock()
+	
+	p.flagMtx.Lock()
+	p.advertiseProtoVer = uint32(msg.ProtocolVersion)
+	p.protocolVersion = minUint32(p.protocolVersion,p.advertiseProtoVer)
+	p.versionKnown = true
+	log.Debugf("Negotiated protocol version %d for peer %s",
+		p.protocolVersion, p)
+	
+	//set the peer's ID
+	p.id = atomic.AddInt32(&nodeCount,1)
+	p.services = msg.Services
+	
+	// set the remote peer's user agent
+	p.userAgent = msg.UserAgent
+	
+	if p.services & wire.SFNodeWitness== wire.SFNodeWitness {
+		p.witnessEnable = true
+	}
+	p.flagMtx.Unlock()
+	if p.services&wire.SFNodeWitness = wire.SFNodeWitness {
+		p.wireEncoding = wire.WitnessEncoding
+	}
+	return nil
 }
+/*
+inHandler协程主要处理接收消息，并回调MessageListener中的消息处理函数对消息进行处理，需要注意的是，回调函数处理消息时不能太耗时，否则会收引起超时断连
+*/
+func (p *peer) inHandler() {
+	//设定一个idleTimer，其超时时间为5分钟。如果每隔5分钟内没有从Peer接收到消息，则主动与该Peer断开连接。我们在后面分析pingHandler时将会看到，往Peer发送ping消息的周期是2分钟，也就是说最多约2分钟多一点(2min + RTT + Peer处理Ping的时间，其中RTT一般为ms级)需要收到Peer回复的Pong消息，所以如果5min没有收到回复，可以认为Peer已经失去联系
+	idleTimer := time.AfterFunc(idleTimeout,func(){
+		log.Warnf("Peer %s no answer for %s -- disconnecting",p,idleTimeout)
+		p.Disconnect()
+	})
+	//循环读取和处理从Peer发过来的消息。当5min内收到消息时，idleTimer暂时停止。请注意，消息读取完毕后，inHandler向stallHandler通过stallControl channel发送了sccReceiveMessage消息，并随后发送了sccHandlerStart，stallHandler会根据这些消息来计算节点接收并处理消息所消耗的时间，我们在后面分析stallHandler分详细介绍。
+out:
+	for atomic.LoadInt32(&p.disconnect) == 0 {
+		rmsg,buf,err := p.readMessage(p.wireEncoding)
+		idleTimer.Stop()
+		if err != nil {
+			if p.isAllowedReadError(err) {
+				log.Debugf("Connected to %s", p.Addr())
+				idleTimer.Reset(idleTimeout)
+				continue
+			}
+			
+			if p.shouldHandleReadError(err) {
+				errMsg := fmt.Sprintf("Can't read message from %s: %v", p, err)
+				if err != io.ErrUnexpectedEOF {
+					log.Errorf(errMsg)
+				}
+
+				// Push a reject message for the malformed message and wait for
+				// the message to be sent before disconnecting.
+				//
+				// NOTE: Ideally this would include the command in the header if
+				// at least that much of the message was valid, but that is not
+				// currently exposed by wire, so just used malformed for the
+				// command.
+				p.PushRejectMsg("malformed", wire.RejectMalformed, errMsg, nil,
+					true)
+			}
+			break out
+		}
+		atomic.StoreInt64(&p.lastRecv, time.Now().Unix())
+		p.stallControl <- stallControlMsg{sccHandlerStart,rmsg}
+		//在处理Peer发送过来的消息时，inHandler可能先对其作处理，如MsgPing和MsgPong，也可能不对其作任何处理，如MsgBlock等等，然后回调MessageListener的对应函数作处理。
+		swicht msg:= rmsg.(type){
+		case *wire.MsgVersion:
+			p.PushRejectMsg(msg.Command(), wire.RejectDuplicate,
+				"duplicate version message", nil, true)
+			break out
+		case *wire.MsgVerAck:
+
+			// No read lock is necessary because verAckReceived is not written
+			// to in any other goroutine.
+			if p.verAckReceived {
+				log.Infof("Already received 'verack' from peer %v -- "+
+					"disconnecting", p)
+				break out
+			}
+			p.flagsMtx.Lock()
+			p.verAckReceived = true
+			p.flagsMtx.Unlock()
+			if p.cfg.Listeners.OnVerAck != nil {
+				p.cfg.Listeners.OnVerAck(p, msg)
+			}
+
+		case *wire.MsgGetAddr:
+			if p.cfg.Listeners.OnGetAddr != nil {
+				p.cfg.Listeners.OnGetAddr(p, msg)
+			}
+
+		case *wire.MsgAddr:
+			if p.cfg.Listeners.OnAddr != nil {
+				p.cfg.Listeners.OnAddr(p, msg)
+			}
+
+		case *wire.MsgPing:
+			p.handlePingMsg(msg)
+			if p.cfg.Listeners.OnPing != nil {
+				p.cfg.Listeners.OnPing(p, msg)
+			}
+
+		case *wire.MsgPong:
+			p.handlePongMsg(msg)
+			if p.cfg.Listeners.OnPong != nil {
+				p.cfg.Listeners.OnPong(p, msg)
+			}
+
+		case *wire.MsgAlert:
+			if p.cfg.Listeners.OnAlert != nil {
+				p.cfg.Listeners.OnAlert(p, msg)
+			}
+
+		case *wire.MsgMemPool:
+			if p.cfg.Listeners.OnMemPool != nil {
+				p.cfg.Listeners.OnMemPool(p, msg)
+			}
+
+		case *wire.MsgTx:
+			if p.cfg.Listeners.OnTx != nil {
+				p.cfg.Listeners.OnTx(p, msg)
+			}
+
+		case *wire.MsgBlock:
+			if p.cfg.Listeners.OnBlock != nil {
+				p.cfg.Listeners.OnBlock(p, msg, buf)
+			}
+
+		case *wire.MsgInv:
+			if p.cfg.Listeners.OnInv != nil {
+				p.cfg.Listeners.OnInv(p, msg)
+			}
+
+		case *wire.MsgHeaders:
+			if p.cfg.Listeners.OnHeaders != nil {
+				p.cfg.Listeners.OnHeaders(p, msg)
+			}
+
+		case *wire.MsgNotFound:
+			if p.cfg.Listeners.OnNotFound != nil {
+				p.cfg.Listeners.OnNotFound(p, msg)
+			}
+
+		case *wire.MsgGetData:
+			if p.cfg.Listeners.OnGetData != nil {
+				p.cfg.Listeners.OnGetData(p, msg)
+			}
+
+		case *wire.MsgGetBlocks:
+			if p.cfg.Listeners.OnGetBlocks != nil {
+				p.cfg.Listeners.OnGetBlocks(p, msg)
+			}
+
+		case *wire.MsgGetHeaders:
+			if p.cfg.Listeners.OnGetHeaders != nil {
+				p.cfg.Listeners.OnGetHeaders(p, msg)
+			}
+
+		case *wire.MsgGetCFilters:
+			if p.cfg.Listeners.OnGetCFilters != nil {
+				p.cfg.Listeners.OnGetCFilters(p, msg)
+			}
+
+		case *wire.MsgGetCFHeaders:
+			if p.cfg.Listeners.OnGetCFHeaders != nil {
+				p.cfg.Listeners.OnGetCFHeaders(p, msg)
+			}
+
+		case *wire.MsgGetCFCheckpt:
+			if p.cfg.Listeners.OnGetCFCheckpt != nil {
+				p.cfg.Listeners.OnGetCFCheckpt(p, msg)
+			}
+
+		case *wire.MsgCFilter:
+			if p.cfg.Listeners.OnCFilter != nil {
+				p.cfg.Listeners.OnCFilter(p, msg)
+			}
+
+		case *wire.MsgCFHeaders:
+			if p.cfg.Listeners.OnCFHeaders != nil {
+				p.cfg.Listeners.OnCFHeaders(p, msg)
+			}
+
+		case *wire.MsgFeeFilter:
+			if p.cfg.Listeners.OnFeeFilter != nil {
+				p.cfg.Listeners.OnFeeFilter(p, msg)
+			}
+
+		case *wire.MsgFilterAdd:
+			if p.cfg.Listeners.OnFilterAdd != nil {
+				p.cfg.Listeners.OnFilterAdd(p, msg)
+			}
+
+		case *wire.MsgFilterClear:
+			if p.cfg.Listeners.OnFilterClear != nil {
+				p.cfg.Listeners.OnFilterClear(p, msg)
+			}
+
+		case *wire.MsgFilterLoad:
+			if p.cfg.Listeners.OnFilterLoad != nil {
+				p.cfg.Listeners.OnFilterLoad(p, msg)
+			}
+
+		case *wire.MsgMerkleBlock:
+			if p.cfg.Listeners.OnMerkleBlock != nil {
+				p.cfg.Listeners.OnMerkleBlock(p, msg)
+			}
+
+		case *wire.MsgReject:
+			if p.cfg.Listeners.OnReject != nil {
+				p.cfg.Listeners.OnReject(p, msg)
+			}
+
+		case *wire.MsgSendHeaders:
+			p.flagsMtx.Lock()
+			p.sendHeadersPreferred = true
+			p.flagsMtx.Unlock()
+
+			if p.cfg.Listeners.OnSendHeaders != nil {
+				p.cfg.Listeners.OnSendHeaders(p, msg)
+			}
+
+		default:
+			log.Debugf("Received unhandled message of type %v "+
+				"from %v", rmsg.Command(), p)
+		}
+		//在处理完一条消息后，inHandler向stallHandler发送sccHandlerDone，通知stallHandler消息处理完毕。同时，将idleTimer复位再次开始计时，并等待读取下一条消息;
+		p.stallControl <- stallControlMsg{sccHandlerDone, rmsg}
+		idleTimer.Reset(idleTimeout)
+	}
+	//当主动调用Disconnect()与Peer断开连接后，消息读取和处理循环将退出，inHandler协和也准备退出。退出之前，先将idleTimer停止，并再次主动调用Disconnect()强制与Peer断开连接，最后通过inQuit channel向stallHandler通知自己已经退出
+	idleTimer.Stop()
+	p.Disconnect()
+	close(p.inQuit)
+	log.Tracef("Peer input handler done for %s", p)
+	
+}
+
+func (p *Peer) outHandler() {
+	out:
+	for{
+		select {
+		case msg:= <- p.sendQueue:
+			switch m := msg.msg.(type){
+			case *wire.MsgPing:
+				if p.ProtocolVersion() > wire.BIP0031Version{
+					p.statsMtx.Lock()
+					p.lashPingNonce = m.Nonce
+					p.lastPingTime = time.Now()
+					p.statsMtx = Unlock()
+				}
+			}
+			p.stallControl <- stallControlMsg{sccSendMessage,msg,msg}
+			err := p.writeMessage(msg.msg,msg.encoding)
+			if err != nil {
+				p.Disconnect()
+				if p.shouldLogWriteError(err){
+					log.Errorf("Failed to send message to "+
+						"%s: %v", p, err)
+				}
+				if msg.doneChan != nil {
+					msg.doneChan <- struct {}{}
+				}
+				continue
+			}
+			atomic.StoreInt64(&p.lastSend,time.Now().Unix())
+			if msg.doneChan != nil {
+				msg.doneChan <- struct {}{}
+			}			
+			p.sendDoneQueue <- struct {}{}
+		case <- p.quit:
+			break out
+		}
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
